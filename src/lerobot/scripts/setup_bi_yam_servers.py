@@ -70,24 +70,15 @@ def check_all_can_interfaces():
 
 
 def find_i2rt_script():
-    """Find the i2rt minimum_gello.py script from the installed package."""
-    try:
-        import i2rt
-
-        i2rt_path = os.path.dirname(i2rt.__file__)
-        script_path = os.path.join(os.path.dirname(i2rt_path), "scripts", "minimum_gello.py")
-        if os.path.exists(script_path):
-            return script_path
-    except ImportError:
-        raise RuntimeError(
-            "Could not import i2rt. Please install it separately:\n"
-            "  cd i2rt && pip install -e . && cd ..\n"
-            "Then install LeRobot: pip install -e '.[yam]'"
-        )
+    """Find the i2rt minimum_gello.py script from the i2rt submodule."""
+    lerobot_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    script_path = os.path.join(lerobot_root, "i2rt", "scripts", "minimum_gello.py")
+    if os.path.exists(script_path):
+        return script_path
 
     raise RuntimeError(
         "Could not find i2rt minimum_gello.py script. "
-        "The i2rt installation may be incomplete."
+        "The i2rt submodule may be missing or incomplete."
     )
 
 
