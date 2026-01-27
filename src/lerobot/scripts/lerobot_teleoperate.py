@@ -49,6 +49,27 @@ lerobot-teleoperate \
   --display_data=true
 ```
 
+Example teleoperation with bimanual Yam:
+
+```shell
+# First, start the server processes (in a separate terminal):
+# python -m lerobot.scripts.setup_bi_yam_servers
+
+lerobot-teleoperate \
+  --robot.type=bi_yam_follower \
+  --robot.left_arm_port=1235 \
+  --robot.right_arm_port=1234 \
+  --robot.cameras='{
+    left: {"type": "opencv", "index_or_path": 0, "width": 640, "height": 480, "fps": 30},
+    top: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
+    right: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30}
+  }' \
+  --teleop.type=bi_yam_leader \
+  --teleop.left_arm_port=5002 \
+  --teleop.right_arm_port=5001 \
+  --display_data=true
+```
+
 """
 
 import logging
@@ -71,6 +92,7 @@ from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
     bi_so100_follower,
+    bi_yam_follower,
     hope_jr,
     koch_follower,
     make_robot_from_config,
@@ -81,6 +103,7 @@ from lerobot.teleoperators import (  # noqa: F401
     Teleoperator,
     TeleoperatorConfig,
     bi_so100_leader,
+    bi_yam_leader,
     gamepad,
     homunculus,
     koch_leader,
