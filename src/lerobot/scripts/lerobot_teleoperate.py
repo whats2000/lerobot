@@ -115,6 +115,70 @@ from lerobot.utils.import_utils import register_third_party_devices
 from lerobot.utils.robot_utils import busy_wait
 from lerobot.utils.utils import init_logging, move_cursor_up
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
+from threading import Lock, Thread
+from typing import Any
+
+
+class BackgroundCameraReader:
+    """Reads camera observations in a background thread without blocking the control loop.
+
+    Supports timestamp-based synchronization for data collection by tracking when each
+    frame was captured.
+    """
+
+    def __init__(self, robot: Robot):
+        self.robot = robot
+        self.latest_camera_obs: dict[str, Any] = {}
+        self.latest_timestamps: dict[str, float] = {}  # Timestamps for each camera
+        self.lock = Lock()
+        self.stop_event = False
+        self.thread: Thread | None = None
+
+    def start(self) -> None:
+        """Start the background camera reading thread."""
+        self.stop_event = False
+        self.thread = Thread(target=self._read_loop, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        """Stop the background camera reading thread."""
+        self.stop_event = True
+        if self.thread is not None:
+            self.thread.join(timeout=1.0)
+            self.thread = None
+
+    def _read_loop(self) -> None:
+        """Continuously read camera observations in the background."""
+        while not self.stop_event:
+            try:
+                if hasattr(self.robot, "get_camera_observation_with_timestamps"):
+                    camera_obs, timestamps = self.robot.get_camera_observation_with_timestamps()
+                    with self.lock:
+                        self.latest_camera_obs = camera_obs
+                        self.latest_timestamps = timestamps
+                elif hasattr(self.robot, "get_camera_observation"):
+                    camera_obs = self.robot.get_camera_observation()
+                    with self.lock:
+                        self.latest_camera_obs = camera_obs
+            except Exception as e:
+                logging.warning(f"Background camera read error: {e}")
+                time.sleep(0.01)  # Small sleep on error to prevent tight loop
+
+    def get_latest(self) -> dict[str, Any]:
+        """Get the latest camera observations without blocking."""
+        with self.lock:
+            return self.latest_camera_obs.copy()
+
+    def get_latest_with_timestamps(self) -> tuple[dict[str, Any], dict[str, float]]:
+        """Get the latest camera observations and their timestamps without blocking.
+
+        Returns:
+            tuple containing:
+                - dict of camera observations (cam_key -> frame)
+                - dict of timestamps (cam_key -> timestamp)
+        """
+        with self.lock:
+            return self.latest_camera_obs.copy(), self.latest_timestamps.copy()
 
 
 @dataclass
@@ -158,50 +222,71 @@ def teleop_loop(
     display_len = max(len(key) for key in robot.action_features)
     start = time.perf_counter()
 
-    while True:
-        loop_start = time.perf_counter()
+    # Check if robot supports separate camera observation for non-blocking control
+    has_separate_camera_obs = hasattr(robot, "get_camera_observation")
 
-        # Get robot observation
-        # Not really needed for now other than for visualization
-        # teleop_action_processor can take None as an observation
-        # given that it is the identity processor as default
-        obs = robot.get_observation()
+    # Start background camera reader if display_data is enabled and robot supports it
+    # This ensures camera reading never blocks the control loop
+    bg_camera_reader: BackgroundCameraReader | None = None
+    if display_data and has_separate_camera_obs:
+        bg_camera_reader = BackgroundCameraReader(robot)
+        bg_camera_reader.start()
 
-        # Get teleop action
-        raw_action = teleop.get_action()
+    try:
+        while True:
+            loop_start = time.perf_counter()
 
-        # Process teleop action through pipeline
-        teleop_action = teleop_action_processor((raw_action, obs))
+            # Get robot observation (without cameras - they're read in background)
+            if has_separate_camera_obs:
+                obs = robot.get_observation(include_cameras=False)
+            else:
+                obs = robot.get_observation()
 
-        # Process action for robot through pipeline
-        robot_action_to_send = robot_action_processor((teleop_action, obs))
+            # Get teleop action
+            raw_action = teleop.get_action()
 
-        # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
-        _ = robot.send_action(robot_action_to_send)
+            # Process teleop action through pipeline
+            teleop_action = teleop_action_processor((raw_action, obs))
 
-        if display_data:
-            # Process robot observation through pipeline
-            obs_transition = robot_observation_processor(obs)
+            # Process action for robot through pipeline
+            robot_action_to_send = robot_action_processor((teleop_action, obs))
 
-            log_rerun_data(
-                observation=obs_transition,
-                action=teleop_action,
-            )
+            # Send processed action to robot (robot_action_processor.to_output should return dict[str, Any])
+            _ = robot.send_action(robot_action_to_send)
+            action_timestamp = time.perf_counter()  # Record when action was sent
 
-            print("\n" + "-" * (display_len + 10))
-            print(f"{'NAME':<{display_len}} | {'NORM':>7}")
-            # Display the final robot action that was sent
-            for motor, value in robot_action_to_send.items():
-                print(f"{motor:<{display_len}} | {value:>7.2f}")
-            move_cursor_up(len(robot_action_to_send) + 5)
+            if display_data:
+                # Get latest camera observations from background thread (non-blocking)
+                if bg_camera_reader is not None:
+                    camera_obs, _ = bg_camera_reader.get_latest_with_timestamps()
+                    obs.update(camera_obs)
 
-        dt_s = time.perf_counter() - loop_start
-        busy_wait(1 / fps - dt_s)
-        loop_s = time.perf_counter() - loop_start
-        print(f"\ntime: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+                # Process robot observation through pipeline
+                obs_transition = robot_observation_processor(obs)
 
-        if duration is not None and time.perf_counter() - start >= duration:
-            return
+                log_rerun_data(
+                    observation=obs_transition,
+                    action=teleop_action,
+                )
+
+                print("\n" + "-" * (display_len + 10))
+                print(f"{'NAME':<{display_len}} | {'NORM':>7}")
+                # Display the final robot action that was sent
+                for motor, value in robot_action_to_send.items():
+                    print(f"{motor:<{display_len}} | {value:>7.2f}")
+                move_cursor_up(len(robot_action_to_send) + 5)
+
+            dt_s = time.perf_counter() - loop_start
+            busy_wait(1 / fps - dt_s)
+            loop_s = time.perf_counter() - loop_start
+            print(f"\ntime: {loop_s * 1e3:.2f}ms ({1 / loop_s:.0f} Hz)")
+
+            if duration is not None and time.perf_counter() - start >= duration:
+                return
+    finally:
+        # Stop background camera reader when loop ends
+        if bg_camera_reader is not None:
+            bg_camera_reader.stop()
 
 
 @parser.wrap()

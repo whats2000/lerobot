@@ -217,12 +217,16 @@ class BiYamFollower(Robot):
         """Setup motors (not needed for Yam arms)."""
         pass
 
-    def get_observation(self) -> dict[str, Any]:
+    def get_observation(self, include_cameras: bool = True) -> dict[str, Any]:
         """
-        Get current observation from both arms and cameras.
+        Get current observation from both arms and optionally cameras.
+
+        Args:
+            include_cameras: If True, include camera images in observation.
+                            Set to False for faster observation when cameras are not needed.
 
         Returns:
-            Dictionary with joint positions for both arms and camera images
+            Dictionary with joint positions for both arms and optionally camera images
         """
         obs_dict = {}
 
@@ -256,14 +260,58 @@ class BiYamFollower(Robot):
             else:
                 obs_dict[f"right_joint_{i}.pos"] = pos
 
-        # Get camera observations
+        # Get camera observations only if requested
+        if include_cameras:
+            for cam_key, cam in self.cameras.items():
+                start = time.perf_counter()
+                obs_dict[cam_key] = cam.async_read()
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+        return obs_dict
+
+    def get_camera_observation(self) -> dict[str, Any]:
+        """
+        Get current camera observations only.
+
+        Returns:
+            Dictionary with camera images
+        """
+        obs_dict = {}
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
-
         return obs_dict
+
+    def get_camera_observation_with_timestamps(self) -> tuple[dict[str, Any], dict[str, float]]:
+        """
+        Get current camera observations with their capture timestamps.
+
+        This method is useful for data collection where frame-action synchronization
+        is needed. Each camera frame is returned along with its capture timestamp.
+
+        Returns:
+            tuple containing:
+                - Dictionary with camera images (cam_key -> frame)
+                - Dictionary with timestamps (cam_key -> timestamp)
+        """
+        obs_dict = {}
+        timestamps = {}
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            if hasattr(cam, "async_read_with_timestamp"):
+                frame, timestamp = cam.async_read_with_timestamp()
+                obs_dict[cam_key] = frame
+                timestamps[cam_key] = timestamp
+            else:
+                # Fallback for cameras without timestamp support
+                obs_dict[cam_key] = cam.async_read()
+                timestamps[cam_key] = time.perf_counter()
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+        return obs_dict, timestamps
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """

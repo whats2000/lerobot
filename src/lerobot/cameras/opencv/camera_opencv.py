@@ -123,6 +123,7 @@ class OpenCVCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
+        self.latest_frame_timestamp: float = 0.0  # Timestamp when frame was captured
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
@@ -442,9 +443,11 @@ class OpenCVCamera(Camera):
         while not self.stop_event.is_set():
             try:
                 color_image = self.read()
+                capture_timestamp = time.perf_counter()
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.latest_frame_timestamp = capture_timestamp
                 self.new_frame_event.set()
 
             except DeviceNotConnectedError:
@@ -517,6 +520,50 @@ class OpenCVCamera(Camera):
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
 
         return frame
+
+    def async_read_with_timestamp(self, timeout_ms: float = 200) -> tuple[NDArray[Any], float]:
+        """
+        Reads the latest available frame asynchronously along with its capture timestamp.
+
+        This method is useful for data collection where frame-action synchronization is needed.
+        The timestamp indicates when the frame was actually captured by the camera.
+
+        Args:
+            timeout_ms (float): Maximum time in milliseconds to wait for a frame
+                to become available. Defaults to 200ms (0.2 seconds).
+
+        Returns:
+            tuple[np.ndarray, float]: A tuple containing:
+                - The latest captured frame as a NumPy array
+                - The timestamp (from time.perf_counter()) when the frame was captured
+
+        Raises:
+            DeviceNotConnectedError: If the camera is not connected.
+            TimeoutError: If no frame becomes available within the specified timeout.
+            RuntimeError: If an unexpected error occurs.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        if self.thread is None or not self.thread.is_alive():
+            self._start_read_thread()
+
+        if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            thread_alive = self.thread is not None and self.thread.is_alive()
+            raise TimeoutError(
+                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
+                f"Read thread alive: {thread_alive}."
+            )
+
+        with self.frame_lock:
+            frame = self.latest_frame
+            timestamp = self.latest_frame_timestamp
+            self.new_frame_event.clear()
+
+        if frame is None:
+            raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
+
+        return frame, timestamp
 
     def disconnect(self) -> None:
         """

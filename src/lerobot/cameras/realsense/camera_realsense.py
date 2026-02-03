@@ -134,6 +134,7 @@ class RealSenseCamera(Camera):
         self.stop_event: Event | None = None
         self.frame_lock: Lock = Lock()
         self.latest_frame: NDArray[Any] | None = None
+        self.latest_frame_timestamp: float = 0.0  # Timestamp when frame was captured
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
@@ -180,6 +181,7 @@ class RealSenseCamera(Camera):
                 f"Failed to open {self}.Run `lerobot-find-cameras realsense` to find available cameras."
             ) from e
 
+        self._configure_sensor_options()
         self._configure_capture_settings()
 
         if warmup:
@@ -281,6 +283,43 @@ class RealSenseCamera(Camera):
             rs_config.enable_stream(rs.stream.color)
             if self.use_depth:
                 rs_config.enable_stream(rs.stream.depth)
+
+    def _configure_sensor_options(self) -> None:
+        """Configures sensor options like auto exposure and auto white balance.
+
+        Disables auto exposure for both depth and color sensors to ensure consistent
+        exposure settings. Enables auto white balance for the color sensor.
+
+        Raises:
+            DeviceNotConnectedError: If device is not connected.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"Cannot configure sensor options for {self} as it is not connected.")
+
+        if self.rs_profile is None:
+            raise RuntimeError(f"{self}: rs_profile must be initialized before use.")
+
+        device = self.rs_profile.get_device()
+        sensors = device.query_sensors()
+
+        for sensor in sensors:
+            sensor_name = sensor.get_info(rs.camera_info.name)
+
+            # Configure depth sensor (Stereo Module)
+            if sensor_name == "Stereo Module":
+                if sensor.supports(rs.option.enable_auto_exposure):
+                    logger.info(f"{self}: Disabling auto exposure for Depth sensor")
+                    sensor.set_option(rs.option.enable_auto_exposure, True)
+
+            # Configure color sensor (RGB Camera)
+            elif sensor_name == "RGB Camera":
+                if sensor.supports(rs.option.enable_auto_exposure):
+                    logger.info(f"{self}: Disabling auto exposure for Color sensor")
+                    sensor.set_option(rs.option.enable_auto_exposure, True)
+
+                if sensor.supports(rs.option.enable_auto_white_balance):
+                    logger.info(f"{self}: Enabling auto white balance for Color sensor")
+                    sensor.set_option(rs.option.enable_auto_white_balance, True)
 
     def _configure_capture_settings(self) -> None:
         """Sets fps, width, and height from device stream if not already configured.
@@ -465,9 +504,11 @@ class RealSenseCamera(Camera):
         while not self.stop_event.is_set():
             try:
                 color_image = self.read(timeout_ms=500)
+                capture_timestamp = time.perf_counter()
 
                 with self.frame_lock:
                     self.latest_frame = color_image
+                    self.latest_frame_timestamp = capture_timestamp
                 self.new_frame_event.set()
 
             except DeviceNotConnectedError:
@@ -541,6 +582,50 @@ class RealSenseCamera(Camera):
             raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
 
         return frame
+
+    def async_read_with_timestamp(self, timeout_ms: float = 200) -> tuple[NDArray[Any], float]:
+        """
+        Reads the latest available frame data (color) asynchronously along with its capture timestamp.
+
+        This method is useful for data collection where frame-action synchronization is needed.
+        The timestamp indicates when the frame was actually captured by the camera.
+
+        Args:
+            timeout_ms (float): Maximum time in milliseconds to wait for a frame
+                to become available. Defaults to 200ms (0.2 seconds).
+
+        Returns:
+            tuple[np.ndarray, float]: A tuple containing:
+                - The latest captured frame data (color image)
+                - The timestamp (from time.perf_counter()) when the frame was captured
+
+        Raises:
+            DeviceNotConnectedError: If the camera is not connected.
+            TimeoutError: If no frame data becomes available within the specified timeout.
+            RuntimeError: If the background thread died unexpectedly or another error occurs.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        if self.thread is None or not self.thread.is_alive():
+            self._start_read_thread()
+
+        if not self.new_frame_event.wait(timeout=timeout_ms / 1000.0):
+            thread_alive = self.thread is not None and self.thread.is_alive()
+            raise TimeoutError(
+                f"Timed out waiting for frame from camera {self} after {timeout_ms} ms. "
+                f"Read thread alive: {thread_alive}."
+            )
+
+        with self.frame_lock:
+            frame = self.latest_frame
+            timestamp = self.latest_frame_timestamp
+            self.new_frame_event.clear()
+
+        if frame is None:
+            raise RuntimeError(f"Internal error: Event set but no frame available for {self}.")
+
+        return frame, timestamp
 
     def disconnect(self) -> None:
         """
