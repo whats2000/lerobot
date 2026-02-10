@@ -120,6 +120,49 @@ class ControlMode(Enum):
     TELEOP = "teleop"
 
 
+@dataclass
+class InferConfig:
+    robot: RobotConfig
+    policy: PreTrainedConfig | None = None
+    # Optional teleoperator for manual control
+    teleop: TeleoperatorConfig | None = None
+    # Task description for the policy
+    task: str | None = None
+    # Control frequency in Hz
+    fps: int = 30
+    # Display all cameras on screen
+    display_data: bool = False
+    # Use vocal synthesis to read events
+    play_sounds: bool = True
+    # Temporary dataset directory for storing stats (not for recording)
+    temp_dataset_dir: str | Path = ".cache/lerobot_infer"
+    # Rename map for observations
+    rename_map: dict[str, str] | None = None
+    # Temporal ensembling: Number of recent actions to average (1 = disabled, >1 = enabled)
+    temporal_ensemble_k: int = 1
+    # Temporal ensembling: Exponential weights decay factor (1.0 = uniform weights, <1.0 = exponential decay)
+    temporal_ensemble_exp: float = 1.0
+
+    def __post_init__(self):
+        # Parse policy path from CLI args
+        policy_path = parser.get_path_arg("policy")
+        if policy_path:
+            cli_overrides = parser.get_cli_overrides("policy")
+            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
+            self.policy.pretrained_path = policy_path
+
+        if self.policy is None:
+            raise ValueError("Policy is required. Use --policy.path=<path_to_policy>")
+
+        if self.rename_map is None:
+            self.rename_map = {}
+
+    @classmethod
+    def __get_path_fields__(cls) -> list[str]:
+        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        return ["policy"]
+
+
 class TemporalEnsembler:
     """
     Temporal ensembling for smooth action prediction.
@@ -215,50 +258,9 @@ class TemporalEnsembler:
         return smoothed_action
 
 
-@dataclass
-class InferConfig:
-    robot: RobotConfig
-    policy: PreTrainedConfig | None = None
-    # Optional teleoperator for manual control
-    teleop: TeleoperatorConfig | None = None
-    # Task description for the policy
-    task: str | None = None
-    # Control frequency in Hz
-    fps: int = 30
-    # Display all cameras on screen
-    display_data: bool = False
-    # Use vocal synthesis to read events
-    play_sounds: bool = True
-    # Temporary dataset directory for storing stats (not for recording)
-    temp_dataset_dir: str | Path = ".cache/lerobot_infer"
-    # Rename map for observations
-    rename_map: dict[str, str] | None = None
-    # Temporal ensembling: Number of recent actions to average (1 = disabled, >1 = enabled)
-    temporal_ensemble_k: int = 1
-    # Temporal ensembling: Exponential weights decay factor (1.0 = uniform weights, <1.0 = exponential decay)
-    temporal_ensemble_exp: float = 1.0
-
-    def __post_init__(self):
-        # Parse policy path from CLI args
-        policy_path = parser.get_path_arg("policy")
-        if policy_path:
-            cli_overrides = parser.get_cli_overrides("policy")
-            self.policy = PreTrainedConfig.from_pretrained(policy_path, cli_overrides=cli_overrides)
-            self.policy.pretrained_path = policy_path
-
-        if self.policy is None:
-            raise ValueError("Policy is required. Use --policy.path=<path_to_policy>")
-
-        if self.rename_map is None:
-            self.rename_map = {}
-
-    @classmethod
-    def __get_path_fields__(cls) -> list[str]:
-        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
-        return ["policy"]
-
-
-def init_inference_keyboard_listener(play_sounds: bool = True, has_teleop: bool = False):
+def init_inference_keyboard_listener(
+    play_sounds: bool = True, has_teleop: bool = False
+) -> tuple[Any | None, dict]:
     """
     Initializes a keyboard listener for inference control.
 
@@ -323,7 +325,7 @@ def init_inference_keyboard_listener(play_sounds: bool = True, has_teleop: bool 
                 state["exit"] = True
 
         except Exception as e:
-            print(f"Error handling key press: {e}")
+            logging.error(f"Error handling key press: {e}")
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
@@ -339,7 +341,7 @@ def _handle_mode_transition(
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
     temporal_ensembler: TemporalEnsembler | None = None,
-):
+) -> None:
     """
     Handle transitions between control modes, managing teleoperator motor torque and policy state.
 
@@ -359,7 +361,7 @@ def _handle_mode_transition(
         return
 
     try:
-        # Entering TELEOP mode - set zero gains so user can move freely
+        # Entering TELEOP mode - disable torque so user can move freely and reset policy state
         if current_mode == ControlMode.TELEOP and previous_mode != ControlMode.TELEOP:
             if isinstance(teleop, list):
                 if teleop_arm is not None and hasattr(teleop_arm, "bus"):
@@ -423,7 +425,7 @@ def _sync_teleop_with_robot(
     teleop: Teleoperator | list[Teleoperator],
     robot_obs: RobotObservation,
     teleop_arm: Teleoperator | None = None,
-):
+) -> None:
     """
     Synchronize teleoperator position with robot observation.
     This allows smooth takeover when switching from policy to teleoperation mode.
@@ -483,7 +485,7 @@ def inference_loop(
     task: str | None = None,
     display_data: bool = False,
     play_sounds: bool = True,
-):
+) -> None:
     """Main inference loop that switches between policy and teleoperation control."""
 
     teleop_arm = teleop_keyboard = None
@@ -621,7 +623,7 @@ def inference_loop(
 
 
 @parser.wrap()
-def infer(cfg: InferConfig):
+def infer(cfg: InferConfig) -> None:
     """Main inference function."""
     init_logging()
     logging.info(pformat(asdict(cfg)))
@@ -739,7 +741,8 @@ def infer(cfg: InferConfig):
         log_say("Inference stopped", cfg.play_sounds)
 
 
-def main():
+def main() -> None:
+    """Run the inference script."""
     register_third_party_plugins()
     infer()
 
