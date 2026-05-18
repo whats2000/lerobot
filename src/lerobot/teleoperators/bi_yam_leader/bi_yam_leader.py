@@ -108,26 +108,17 @@ class YamLeaderClient:
             raise RuntimeError("Client not connected")
         self._client.update_kp_kd(kp, kd)
 
-    def get_gripper_from_encoder(self) -> float:
-        """
-        Try to get gripper state from teaching handle encoder button.
-        Returns a value between 0 (closed) and 1 (open).
-        Falls back to 1.0 (open) if not available.
+    def get_natural_kp(self) -> np.ndarray:
+        """Return the leader arm's per-joint kp as configured by i2rt at server startup.
+
+        The unified server snapshots ``robot._kp`` in YAMLeaderRobot.__init__ before
+        any update_kp_kd call can overwrite it, so this is the arm-variant-correct
+        baseline for bilateral feedback (YAM / YAM_PRO / YAM_ULTRA / BIG_YAM each
+        ship distinct configs).
         """
         if self._client is None:
             raise RuntimeError("Client not connected")
-        try:
-            # Try to get encoder state if the server exposes it
-            # This requires custom method in the i2rt server
-            obs = self._client.get_observations().result()
-            # Check if encoder button data is available in observations
-            # The encoder button state might be in io_inputs or similar field
-            if "io_inputs" in obs:
-                # Button pressed = closed gripper (0), not pressed = open (1)
-                return 0.0 if obs["io_inputs"][0] > 0.5 else 1.0
-            return 1.0  # Default to open if no encoder data
-        except Exception:
-            return 1.0  # Default to open on any error
+        return self._client.get_natural_kp().result()
 
 
 class BiYamLeader(Teleoperator):
@@ -148,10 +139,10 @@ class BiYamLeader(Teleoperator):
     - Left leader arm server on port 5002 (default)
     - Right leader arm server on port 5001 (default)
 
-    Note: You'll need to run separate server processes for the leader arms.
-    You can modify the i2rt minimum_gello.py script to create read-only
-    servers that just expose the leader arm state without trying to control
-    a follower.
+    Note: Launch the leader RPC servers via
+    ``src/lerobot/robots/bi_yam_follower/run_bimanual_yam_server.py``, which
+    starts both leader arms (and both followers) in one process with the
+    update_kp_kd endpoint bound.
     """
 
     config_class = BiYamLeaderConfig
@@ -244,8 +235,19 @@ class BiYamLeader(Teleoperator):
 
         logger.info(f"Left leader arm DOFs: {self._left_dofs}, Right leader arm DOFs: {self._right_dofs}")
 
-        # Store a default kp value for bilateral control
-        self._original_kp = np.ones(6) * 10.0
+        # Apply the configured bilateral_kp so send_feedback is honored from
+        # the start. With bilateral_kp == 0.0 we skip the natural-kp fetch
+        # entirely so the client stays compatible with older server builds
+        # that don't expose the get_natural_kp RPC.
+        if self.bilateral_kp > 0.0:
+            # Fetch the leader's natural kp so bilateral feedback runs at the
+            # i2rt-configured stiffness for whichever arm variant is connected
+            # (YAM / YAM_PRO / YAM_ULTRA / BIG_YAM ship different per-joint
+            # defaults). Assumes left/right are the same variant; if they
+            # diverge in the future, fetch and store per-arm.
+            self._original_kp = self.left_arm.get_natural_kp()
+            logger.info(f"Leader natural kp from i2rt config: {self._original_kp}")
+            self.enable_torque()
 
         logger.info("Successfully connected to bimanual Yam leader arms")
 
@@ -288,8 +290,12 @@ class BiYamLeader(Teleoperator):
         if left_has_gripper:
             left_joint_pos = np.concatenate([left_joint_pos, left_obs["gripper_pos"]])
         else:
-            # Teaching handle: try to get gripper from encoder button
-            left_gripper = self.left_arm.get_gripper_from_encoder()
+            # Teaching handle: use io_inputs from the observations we already fetched
+            # above, instead of issuing a second get_observations RPC round-trip.
+            if "io_inputs" in left_obs:
+                left_gripper = 0.0 if left_obs["io_inputs"][0] > 0.5 else 1.0
+            else:
+                left_gripper = 1.0  # Default to open
             left_joint_pos = np.concatenate([left_joint_pos, [left_gripper]])
             left_has_gripper = True
 
@@ -310,8 +316,11 @@ class BiYamLeader(Teleoperator):
         if right_has_gripper:
             right_joint_pos = np.concatenate([right_joint_pos, right_obs["gripper_pos"]])
         else:
-            # Teaching handle: try to get gripper from encoder button
-            right_gripper = self.right_arm.get_gripper_from_encoder()
+            # Teaching handle: use io_inputs from already-fetched observations
+            if "io_inputs" in right_obs:
+                right_gripper = 0.0 if right_obs["io_inputs"][0] > 0.5 else 1.0
+            else:
+                right_gripper = 1.0  # Default to open
             right_joint_pos = np.concatenate([right_joint_pos, [right_gripper]])
             right_has_gripper = True
 
@@ -371,55 +380,56 @@ class BiYamLeader(Teleoperator):
         if len(right_positions) == 6:
             self.right_arm.command_joint_pos(np.array(right_positions))
 
-    def set_teleop_mode(self, enabled: bool = True, bilateral_kp: float = 0.0) -> None:
-        """Configure bilateral control gains for the leader arms.
+    def enable_torque(self) -> None:
+        """Put the leader into position-tracking mode (follows ``send_feedback`` goals).
 
-        When enabled=True: Sets gains to zero for free manual movement with gravity compensation
-        When enabled=False: Sets gains for position tracking with specified stiffness
-
-        Args:
-            enabled: If True, disable position tracking (gains=0); if False, enable tracking
-            bilateral_kp: Stiffness multiplier when tracking is enabled (typical: 0.5-2.0)
+        Sets non-zero PD gains scaled by ``self.bilateral_kp`` so the leader arms
+        actively track commanded positions. The kp baseline is the per-joint
+        natural kp fetched from the server in ``connect()``.
         """
         if self._original_kp is None:
-            logger.warning("Original kp not set, using default")
-            self._original_kp = np.ones(6) * 10.0
+            raise RuntimeError("Natural kp not initialized; call connect() before enable_torque().")
 
+        kp = self._original_kp * self.bilateral_kp
         zero_gains = np.zeros(6)
+        try:
+            self.left_arm.update_kp_kd(kp, zero_gains)
+            self.right_arm.update_kp_kd(kp, zero_gains)
 
-        if enabled:
-            # Zero gains: free movement with gravity compensation only
-            try:
-                # Update gains first (command_joint_pos copies gains into commands)
-                self.left_arm.update_kp_kd(zero_gains, zero_gains)
-                self.right_arm.update_kp_kd(zero_gains, zero_gains)
+            logger.info(f"Bilateral control enabled: kp={self.bilateral_kp}*original={kp[0]:.1f}")
+        except Exception as e:
+            logger.warning(f"Failed to enable bilateral control: {e}")
 
-                # Command current position as reference for gravity compensation
-                left_obs = self.left_arm.get_observations()
-                right_obs = self.right_arm.get_observations()
-                left_pos = left_obs["joint_pos"]
-                right_pos = right_obs["joint_pos"]
+    def disable_torque(self) -> None:
+        """Put the leader into free-movement mode (gravity compensation only).
 
-                self.left_arm.command_joint_pos(left_pos)
-                self.right_arm.command_joint_pos(right_pos)
+        Sets PD gains to zero and commands the current position as the reference so
+        the arms remain freely movable under gravity compensation.
+        """
+        zero_gains = np.zeros(6)
+        try:
+            # Update gains first (command_joint_pos copies gains into commands)
+            self.left_arm.update_kp_kd(zero_gains, zero_gains)
+            self.right_arm.update_kp_kd(zero_gains, zero_gains)
 
-                logger.info("Bilateral control disabled: arms free to move (kp=0, kd=0)")
-            except Exception as e:
-                logger.warning(f"Failed to disable bilateral control: {e}")
-        else:
-            # Non-zero gains: position tracking enabled
-            kp = self._original_kp * bilateral_kp
-            try:
-                self.left_arm.update_kp_kd(kp, zero_gains)
-                self.right_arm.update_kp_kd(kp, zero_gains)
+            # Command current position as reference for gravity compensation
+            left_obs = self.left_arm.get_observations()
+            right_obs = self.right_arm.get_observations()
+            self.left_arm.command_joint_pos(left_obs["joint_pos"])
+            self.right_arm.command_joint_pos(right_obs["joint_pos"])
 
-                logger.info(f"Bilateral control enabled: kp={bilateral_kp}*original={kp[0]:.1f}")
-            except Exception as e:
-                logger.warning(f"Failed to enable bilateral control: {e}")
+            logger.info("Bilateral control disabled: arms free to move (kp=0, kd=0)")
+        except Exception as e:
+            logger.warning(f"Failed to disable bilateral control: {e}")
 
     def disconnect(self) -> None:
         """Disconnect from both leader arms."""
         logger.info("Disconnecting from bimanual Yam leader arms")
+
+        # Release bilateral PD so the arms don't continue holding their last
+        # commanded pose against the operator after the client goes away.
+        if self.bilateral_kp > 0.0:
+            self.disable_torque()
 
         self.left_arm.disconnect()
         self.right_arm.disconnect()
