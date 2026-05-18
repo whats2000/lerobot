@@ -31,6 +31,8 @@ import PIL.Image
 import pyarrow.parquet as pq
 import torch
 
+from lerobot.configs import VideoEncoderConfig, camera_encoder_defaults
+
 from .compute_stats import compute_episode_stats
 from .dataset_metadata import LeRobotDatasetMetadata
 from .feature_utils import (
@@ -55,7 +57,6 @@ from .video_utils import (
     concatenate_video_files,
     encode_video_frames,
     get_video_duration_in_s,
-    info_to_encoding_kwargs,
 )
 
 logger = logging.getLogger(__name__)
@@ -66,21 +67,19 @@ def _encode_video_worker(
     episode_index: int,
     root: Path,
     fps: int,
-    vcodec: str = "libsvtav1",
+    camera_encoder: VideoEncoderConfig | None = None,
     encoder_threads: int | None = None,
-    **encoding_kwargs,
 ) -> Path:
     temp_path = Path(tempfile.mkdtemp(dir=root)) / f"{video_key}_{episode_index:03d}.mp4"
     fpath = DEFAULT_IMAGE_PATH.format(image_key=video_key, episode_index=episode_index, frame_index=0)
     img_dir = (root / fpath).parent
     encode_video_frames(
-        imgs_dir=img_dir,
-        video_path=temp_path,
-        fps=fps,
-        vcodec=vcodec,
-        overwrite=True,
+        img_dir,
+        temp_path,
+        fps,
+        camera_encoder=camera_encoder,
         encoder_threads=encoder_threads,
-        **encoding_kwargs,
+        overwrite=True,
     )
     shutil.rmtree(img_dir)
     return temp_path
@@ -97,21 +96,23 @@ class DatasetWriter:
         self,
         meta: LeRobotDatasetMetadata,
         root: Path,
-        vcodec: str,
+        camera_encoder: VideoEncoderConfig | None,
         encoder_threads: int | None,
         batch_encoding_size: int,
         streaming_encoder: StreamingVideoEncoder | None = None,
         initial_frames: int = 0,
         video_feature_encoding_kwargs: dict | None = None,
     ):
-        """Initialize the writer with metadata, codec, and encoding config.
+        """Initialize the writer with metadata, codec, and encoder config.
 
         Args:
             meta: Dataset metadata instance (used for feature schema, chunk
                 settings, and episode persistence).
             root: Local dataset root directory.
-            vcodec: Video codec for encoding (e.g. ``'libsvtav1'``, ``'h264'``).
-            encoder_threads: Threads per encoder instance. ``None`` for auto.
+            camera_encoder: Video encoder settings applied to all cameras.
+                ``None`` uses :func:`~lerobot.configs.camera_encoder_defaults`.
+            encoder_threads: Number of encoder threads (global). ``None``
+                lets the codec decide.
             batch_encoding_size: Number of episodes to accumulate before
                 batch-encoding videos.
             streaming_encoder: Optional pre-built :class:`StreamingVideoEncoder`
@@ -121,7 +122,7 @@ class DatasetWriter:
         """
         self._meta = meta
         self._root = root
-        self._vcodec = vcodec
+        self._camera_encoder = camera_encoder or camera_encoder_defaults()
         self._encoder_threads = encoder_threads
         self._batch_encoding_size = batch_encoding_size
         self._streaming_encoder = streaming_encoder
@@ -289,29 +290,18 @@ class DatasetWriter:
             num_cameras = len(self._meta.video_keys)
             if parallel_encoding and num_cameras > 1:
                 with concurrent.futures.ProcessPoolExecutor(max_workers=num_cameras) as executor:
-                    future_to_key = {}
-                    for video_key in self._meta.video_keys:
-                        encoding_kwargs = info_to_encoding_kwargs(
-                            self._video_feature_encoding_kwargs[video_key]
-                        )
-                        encoding_vcodec = encoding_kwargs.pop("vcodec", self._vcodec)
-                        encoding_fps = encoding_kwargs.pop("fps", self._meta.fps)
-                        if encoding_fps != self._meta.fps:
-                            raise ValueError(
-                                f"Encoding fps {encoding_fps} must match dataset fps {self._meta.fps}"
-                            )
-                        future_to_key[
-                            executor.submit(
-                                _encode_video_worker,
-                                video_key=video_key,
-                                episode_index=episode_index,
-                                root=self._root,
-                                fps=encoding_fps,
-                                vcodec=encoding_vcodec,
-                                encoder_threads=self._encoder_threads,
-                                **encoding_kwargs,
-                            )
-                        ] = video_key
+                    future_to_key = {
+                        executor.submit(
+                            _encode_video_worker,
+                            video_key,
+                            episode_index,
+                            self._root,
+                            self._meta.fps,
+                            self._per_key_encoder(video_key),
+                            self._encoder_threads,
+                        ): video_key
+                        for video_key in self._meta.video_keys
+                    }
 
                     results = {}
                     for future in concurrent.futures.as_completed(future_to_key):
@@ -518,7 +508,7 @@ class DatasetWriter:
 
         # Update video info (only needed when first episode is encoded)
         if episode_index == 0:
-            self._meta.update_video_info(video_key)
+            self._meta.update_video_info(video_key, camera_encoder=self._camera_encoder)
             write_info(self._meta.info, self._meta.root)
 
         metadata = {
@@ -584,26 +574,28 @@ class DatasetWriter:
         if self.image_writer is not None:
             self.image_writer.wait_until_done()
 
+    def _per_key_encoder(self, video_key: str) -> VideoEncoderConfig:
+        """Return the per-feature encoder override (e.g. for depth maps) or the dataset-wide default."""
+        if self._video_feature_encoding_kwargs is None:
+            return self._camera_encoder
+        info = self._video_feature_encoding_kwargs.get(video_key)
+        if not info:
+            return self._camera_encoder
+        if "video.fps" in info and int(info["video.fps"]) != self._meta.fps:
+            raise ValueError(
+                f"Encoding fps {info['video.fps']} for {video_key} must match dataset fps {self._meta.fps}"
+            )
+        return VideoEncoderConfig.from_video_info(info)
+
     def _encode_temporary_episode_video(self, video_key: str, episode_index: int) -> Path:
         """Use ffmpeg to convert frames stored as png into mp4 videos."""
-        video_feature_encoding_kwargs = (
-            self._video_feature_encoding_kwargs.get(video_key, {})
-            if self._video_feature_encoding_kwargs is not None
-            else {}
-        )
-        encoding_kwargs = info_to_encoding_kwargs(video_feature_encoding_kwargs)
-        encoding_vcodec = encoding_kwargs.pop("vcodec", self._vcodec)
-        encoding_fps = encoding_kwargs.pop("fps", self._meta.fps)
-        if encoding_fps != self._meta.fps:
-            raise ValueError(f"Encoding fps {encoding_fps} must match dataset fps {self._meta.fps}")
         return _encode_video_worker(
             video_key,
             episode_index,
             self._root,
-            encoding_fps,
-            encoding_vcodec,
+            self._meta.fps,
+            self._per_key_encoder(video_key),
             self._encoder_threads,
-            **encoding_kwargs,
         )
 
     def close_writer(self) -> None:

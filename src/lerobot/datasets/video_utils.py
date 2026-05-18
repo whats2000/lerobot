@@ -23,7 +23,7 @@ import tempfile
 import threading
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from threading import Lock
@@ -37,107 +37,13 @@ import torch
 from datasets.features.features import register_feature
 from PIL import Image
 
-from lerobot.utils.import_utils import get_safe_default_codec
+from lerobot.configs import (
+    VideoEncoderConfig,
+    camera_encoder_defaults,
+)
+from lerobot.utils.import_utils import get_safe_default_video_backend
 
 logger = logging.getLogger(__name__)
-
-# List of hardware encoders to probe for auto-selection. Availability depends on the platform and FFmpeg build.
-# Determines the order of preference for auto-selection when vcodec="auto" is used.
-HW_ENCODERS = [
-    "h264_videotoolbox",  # macOS
-    "hevc_videotoolbox",  # macOS
-    "h264_nvenc",  # NVIDIA GPU
-    "hevc_nvenc",  # NVIDIA GPU
-    "h264_vaapi",  # Linux Intel/AMD
-    "h264_qsv",  # Intel Quick Sync
-]
-
-VALID_VIDEO_CODECS = {"h264", "hevc", "libsvtav1", "auto"} | set(HW_ENCODERS)
-
-
-def _get_codec_options(
-    vcodec: str,
-    g: int | None = 2,
-    crf: int | None = 30,
-    preset: int | None = None,
-) -> dict:
-    """Build codec-specific options dict for video encoding."""
-    options = {}
-
-    # GOP size (keyframe interval) - supported by VideoToolbox and software encoders
-    if g is not None and (vcodec in ("h264_videotoolbox", "hevc_videotoolbox") or vcodec not in HW_ENCODERS):
-        options["g"] = str(g)
-
-    # Quality control (codec-specific parameter names)
-    if crf is not None:
-        if vcodec in ("h264", "hevc", "libsvtav1"):
-            options["crf"] = str(crf)
-        elif vcodec in ("h264_videotoolbox", "hevc_videotoolbox"):
-            quality = max(1, min(100, int(100 - crf * 2)))
-            options["q:v"] = str(quality)
-        elif vcodec in ("h264_nvenc", "hevc_nvenc"):
-            options["rc"] = "constqp"
-            options["qp"] = str(crf)
-        elif vcodec in ("h264_vaapi",):
-            options["qp"] = str(crf)
-        elif vcodec in ("h264_qsv",):
-            options["global_quality"] = str(crf)
-
-    # Preset (only for libsvtav1)
-    if vcodec == "libsvtav1":
-        options["preset"] = str(preset) if preset is not None else "12"
-
-    return options
-
-
-def detect_available_hw_encoders() -> list[str]:
-    """Probe PyAV/FFmpeg for available hardware video encoders."""
-    available = []
-    for codec_name in HW_ENCODERS:
-        try:
-            av.codec.Codec(codec_name, "w")
-            available.append(codec_name)
-        except Exception:  # nosec B110
-            logger.debug("HW encoder '%s' not available", codec_name)  # nosec B110
-    return available
-
-
-def resolve_vcodec(vcodec: str) -> str:
-    """Validate vcodec and resolve 'auto' to best available HW encoder, fallback to libsvtav1."""
-    if vcodec == "av1":
-        # Alias "av1" to "libsvtav1"
-        vcodec = "libsvtav1"
-    if vcodec not in VALID_VIDEO_CODECS:
-        raise ValueError(f"Invalid vcodec '{vcodec}'. Must be one of: {sorted(VALID_VIDEO_CODECS)}")
-    if vcodec != "auto":
-        logger.info(f"Using video codec: {vcodec}")
-        return vcodec
-    available = detect_available_hw_encoders()
-    for encoder in HW_ENCODERS:
-        if encoder in available:
-            logger.info(f"Auto-selected video codec: {encoder}")
-            return encoder
-    logger.info("No hardware encoder available, falling back to software encoder 'libsvtav1'")
-    return "libsvtav1"
-
-
-def info_to_encoding_kwargs(info: dict) -> dict:
-    encoding_kwargs = {}
-    if "video.fps" in info:
-        encoding_kwargs["fps"] = int(info["video.fps"])
-    if "video.codec" in info:
-        encoding_kwargs["vcodec"] = resolve_vcodec(info["video.codec"])
-    if "video.pix_fmt" in info:
-        encoding_kwargs["pix_fmt"] = info["video.pix_fmt"]
-    if "video.g" in info:
-        encoding_kwargs["g"] = info["video.g"]
-    if "video.crf" in info:
-        encoding_kwargs["crf"] = info["video.crf"]
-    if "video.preset" in info:
-        encoding_kwargs["preset"] = info["video.preset"]
-    if "video.options" in info:
-        encoding_kwargs["options"] = info["video.options"]
-    return encoding_kwargs
 
 
 def decode_video_frames(
@@ -175,7 +81,7 @@ def decode_video_frames(
         )
         return decode_video_frames_depth(video_path, timestamps, tolerance_s, depth_map_decoding_fn)
     if backend is None:
-        backend = get_safe_default_codec()
+        backend = get_safe_default_video_backend()
     if backend == "torchcodec":
         return decode_video_frames_torchcodec(video_path, timestamps, tolerance_s, return_uint8=return_uint8)
     elif backend == "pyav":
@@ -529,19 +435,17 @@ def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
     fps: int,
-    vcodec: str = "libsvtav1",
-    pix_fmt: str = "yuv420p",
-    g: int | None = 2,
-    crf: int | None = 30,
-    fast_decode: int = 0,
+    camera_encoder: VideoEncoderConfig | None = None,
+    encoder_threads: int | None = None,
+    *,
     log_level: int | None = av.logging.WARNING,
     overwrite: bool = False,
-    preset: int | None = None,
-    encoder_threads: int | None = None,
-    options: dict | None = None,
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
-    vcodec = resolve_vcodec(vcodec)
+    if camera_encoder is None:
+        camera_encoder = camera_encoder_defaults()
+    vcodec = camera_encoder.vcodec
+    pix_fmt = camera_encoder.pix_fmt
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -552,45 +456,18 @@ def encode_video_frames(
 
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Encoders/pixel formats incompatibility check
-    if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
-        logger.warning(
-            f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
-        )
-        pix_fmt = "yuv420p"
-
     # Get input frames
     template = "frame-" + ("[0-9]" * 6) + ".png"
     input_list = sorted(
         glob.glob(str(imgs_dir / template)), key=lambda x: int(x.split("-")[-1].split(".")[0])
     )
 
-    # Define video output frame size (assuming all input frames are the same size)
     if len(input_list) == 0:
         raise FileNotFoundError(f"No images found in {imgs_dir}.")
     with Image.open(input_list[0]) as dummy_image:
         width, height = dummy_image.size
 
-    # Define video codec options
-    video_options = _get_codec_options(vcodec, g, crf, preset)
-
-    if fast_decode:
-        key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
-        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
-        video_options[key] = value
-
-    if encoder_threads is not None:
-        if vcodec == "libsvtav1":
-            lp_param = f"lp={encoder_threads}"
-            if "svtav1-params" in video_options:
-                video_options["svtav1-params"] += f":{lp_param}"
-            else:
-                video_options["svtav1-params"] = lp_param
-        else:
-            video_options["threads"] = str(encoder_threads)
-
-    if options is not None:
-        video_options.update({str(key): str(value) for key, value in options.items()})
+    video_options = camera_encoder.get_codec_options(encoder_threads, as_strings=True)
 
     # Set logging level
     if log_level is not None:
@@ -627,7 +504,10 @@ def encode_video_frames(
 
 
 def concatenate_video_files(
-    input_video_paths: list[Path | str], output_video_path: Path, overwrite: bool = True
+    input_video_paths: list[Path | str],
+    output_video_path: Path,
+    overwrite: bool = True,
+    compatibility_check: bool = False,
 ):
     """
     Concatenate multiple video files into a single video file using pyav.
@@ -640,6 +520,7 @@ def concatenate_video_files(
         input_video_paths: Ordered list of input video file paths to concatenate.
         output_video_path: Path to the output video file.
         overwrite: Whether to overwrite the output video file if it already exists. Default is True.
+        compatibility_check: Whether to check if the input videos are compatible. Default is False.
 
     Note:
         - Creates a temporary directory for intermediate files that is cleaned up after use.
@@ -657,6 +538,22 @@ def concatenate_video_files(
 
     if len(input_video_paths) == 0:
         raise FileNotFoundError("No input video paths provided.")
+
+    # This check may be skipped at recording time as videos are encoded with the same encoder config.
+    if compatibility_check:
+        reference_video_info = get_video_info(input_video_paths[0])
+        for input_path in input_video_paths[1:]:
+            video_info = get_video_info(input_path)
+            if (
+                video_info["video.height"] != reference_video_info["video.height"]
+                or video_info["video.width"] != reference_video_info["video.width"]
+                or video_info["video.fps"] != reference_video_info["video.fps"]
+                or video_info["video.codec"] != reference_video_info["video.codec"]
+                or video_info["video.pix_fmt"] != reference_video_info["video.pix_fmt"]
+            ):
+                raise ValueError(
+                    f"Input video {input_path} is not compatible with the reference video {input_video_paths[0]}."
+                )
 
     # Create a temporary .ffconcat file to list the input video paths
     with tempfile.NamedTemporaryFile(mode="w", suffix=".ffconcat", delete=False) as tmp_concatenate_file:
@@ -724,14 +621,10 @@ class _CameraEncoderThread(threading.Thread):
         fps: int,
         vcodec: str,
         pix_fmt: str,
-        g: int | None,
-        crf: int | None,
-        preset: int | None,
+        codec_options: dict[str, str],
         frame_queue: queue.Queue,
         result_queue: queue.Queue,
         stop_event: threading.Event,
-        encoder_threads: int | None = None,
-        options: dict | None = None,
         is_depth_map: bool = False,
         depth_map_encoding_fn: Callable[[np.ndarray], av.VideoFrame] | None = None,
     ):
@@ -740,14 +633,10 @@ class _CameraEncoderThread(threading.Thread):
         self.fps = fps
         self.vcodec = vcodec
         self.pix_fmt = pix_fmt
-        self.g = g
-        self.crf = crf
-        self.preset = preset
-        self.options = options
+        self.codec_options = codec_options
         self.frame_queue = frame_queue
         self.result_queue = result_queue
         self.stop_event = stop_event
-        self.encoder_threads = encoder_threads
         self.is_depth_map = is_depth_map
         self.depth_map_encoding_fn = depth_map_encoding_fn
 
@@ -785,21 +674,9 @@ class _CameraEncoderThread(threading.Thread):
                 # Open container on first frame (to get width/height)
                 if container is None:
                     height, width = frame_data.shape[:2]
-                    video_options = _get_codec_options(self.vcodec, self.g, self.crf, self.preset)
-                    if self.encoder_threads is not None:
-                        if self.vcodec == "libsvtav1":
-                            lp_param = f"lp={self.encoder_threads}"
-                            if "svtav1-params" in video_options:
-                                video_options["svtav1-params"] += f":{lp_param}"
-                            else:
-                                video_options["svtav1-params"] = lp_param
-                        else:
-                            video_options["threads"] = str(self.encoder_threads)
-                    if self.options is not None:
-                        video_options.update({str(key): str(value) for key, value in self.options.items()})
                     Path(self.video_path).parent.mkdir(parents=True, exist_ok=True)
                     container = av.open(str(self.video_path), "w")
-                    output_stream = container.add_stream(self.vcodec, self.fps, options=video_options)
+                    output_stream = container.add_stream(self.vcodec, self.fps, options=self.codec_options)
                     output_stream.pix_fmt = self.pix_fmt
                     output_stream.width = width
                     output_stream.height = height
@@ -868,47 +745,44 @@ class StreamingVideoEncoder:
     def __init__(
         self,
         fps: int,
-        vcodec: str = "libsvtav1",
-        pix_fmt: str = "yuv420p",
-        g: int | None = 2,
-        crf: int | None = 30,
-        preset: int | None = None,
-        options: dict | None = None,
+        camera_encoder: VideoEncoderConfig | None = None,
         queue_maxsize: int = 30,
         encoder_threads: int | None = None,
         video_feature_encoding_kwargs: dict[str, dict] | None = None,
         depth_map_encoding_fn: Callable[[np.ndarray], av.VideoFrame] | None = None,
     ):
-        # The following are default encoding settings that can be overridden
-        # on a per-video-key basis via `video_feature_encoding_kwargs`
-        self.default_encoding_kwargs = {
-            "fps": fps,
-            "vcodec": resolve_vcodec(vcodec),
-            "pix_fmt": pix_fmt,
-            "g": g,
-            "crf": crf,
-            "preset": preset,
-            "options": options,
-        }
-        self.video_feature_encoding_kwargs = {}
+        """
+        Args:
+            fps: Frames per second for the output videos.
+            camera_encoder: Default video encoder settings applied to all cameras.
+                When ``None``, :func:`camera_encoder_defaults` is used. Per-key
+                overrides can be supplied via ``video_feature_encoding_kwargs``.
+            encoder_threads: Number of encoder threads (global setting).
+                ``None`` lets the codec decide.
+            queue_maxsize: Max frames to buffer per camera before
+                back-pressure drops frames.
+            video_feature_encoding_kwargs: Optional mapping of video feature key to a
+                ``video.*`` info dict. Each entry is converted to a
+                :class:`VideoEncoderConfig` that overrides ``camera_encoder`` for that
+                key (used for depth maps and other per-feature encoding settings).
+            depth_map_encoding_fn: Required when any feature in
+                ``video_feature_encoding_kwargs`` has ``video.is_depth_map=True``.
+        """
+        self.fps = fps
+        self._camera_encoder = camera_encoder or camera_encoder_defaults()
+        self._encoder_threads = encoder_threads
+
+        # Per-video-key encoder overrides (depth maps, custom CRF, etc.)
+        self._per_key_encoders: dict[str, VideoEncoderConfig] = {}
+        self.is_depth_map: dict[str, bool] = {}
         if video_feature_encoding_kwargs is not None:
-            for key, enc in video_feature_encoding_kwargs.items():
-                self.video_feature_encoding_kwargs[key] = info_to_encoding_kwargs(enc)
-        self.is_depth_map = {}
-        if video_feature_encoding_kwargs is not None:
-            self.is_depth_map = {
-                video_key: (
-                    video_feature_encoding_kwargs is not None
-                    and video_feature_encoding_kwargs[video_key].get("video.is_depth_map", False)
-                )
-                for video_key in video_feature_encoding_kwargs
-            }
-        # if any of the videos is a depth map, depth_map_encoding_fn must be provided
+            for key, info in video_feature_encoding_kwargs.items():
+                self._per_key_encoders[key] = VideoEncoderConfig.from_video_info(info)
+                self.is_depth_map[key] = bool(info.get("video.is_depth_map", False))
         if any(self.is_depth_map.values()) and depth_map_encoding_fn is None:
             raise ValueError("depth_map_encoding_fn must be provided if any video is a depth map")
 
         self.queue_maxsize = queue_maxsize
-        self.encoder_threads = encoder_threads
 
         self._frame_queues: dict[str, queue.Queue] = {}
         self._result_queues: dict[str, queue.Queue] = {}
@@ -940,25 +814,21 @@ class StreamingVideoEncoder:
             temp_video_dir = Path(tempfile.mkdtemp(dir=temp_dir))
             video_path = temp_video_dir / f"{video_key.replace('/', '_')}_streaming.mp4"
 
-            key_enc = self.video_feature_encoding_kwargs.get(video_key, {})
-            # If specified, fps must be the same with self.fps from meta info
-            if "fps" in key_enc and key_enc["fps"] != self.default_encoding_kwargs["fps"]:
-                raise ValueError(
-                    f"FPS mismatch for {video_key}: {key_enc['fps']} in video_feature_encoding_kwargs vs {self.default_encoding_kwargs['fps']} in default_encoding_kwargs"
-                )
-            key_enc = {
-                **self.default_encoding_kwargs,
-                **key_enc,
-            }  # video_feature_encoding_kwargs overrides defaults
+            # Pick per-key encoder override (e.g. depth-map cfg) when one exists,
+            # otherwise fall back to the dataset-wide camera encoder.
+            encoder_cfg = self._per_key_encoders.get(video_key, self._camera_encoder)
+            codec_options = encoder_cfg.get_codec_options(self._encoder_threads, as_strings=True)
             encoder_thread = _CameraEncoderThread(
                 video_path=video_path,
+                fps=self.fps,
+                vcodec=encoder_cfg.vcodec,
+                pix_fmt=encoder_cfg.pix_fmt,
+                codec_options=codec_options,
                 frame_queue=frame_queue,
                 result_queue=result_queue,
                 stop_event=stop_event,
-                encoder_threads=self.encoder_threads,
                 is_depth_map=self.is_depth_map.get(video_key, False),
                 depth_map_encoding_fn=self._depth_map_encoding_fn,
-                **key_enc,
             )
             encoder_thread.start()
 
@@ -1163,8 +1033,18 @@ def get_audio_info(video_path: Path | str) -> dict:
     return audio_info
 
 
-def get_video_info(video_path: Path | str) -> dict:
-    # Set logging level
+def get_video_info(
+    video_path: Path | str,
+    camera_encoder: VideoEncoderConfig | None = None,
+) -> dict:
+    """Build the ``video.*`` / ``audio.*`` info dict persisted in ``info.json``.
+
+    Args:
+        video_path: Path to the encoded video file to probe.
+        camera_encoder: If provided, record the exact encoder settings used to encode this
+            video. Stream-derived values take precedence — encoder fields are only written for keys
+            not already populated from the video file itself.
+    """
     logging.getLogger("libav").setLevel(av.logging.WARNING)
 
     # Getting video stream information
@@ -1194,6 +1074,14 @@ def get_video_info(video_path: Path | str) -> dict:
 
     # Adding audio stream information
     video_info.update(**get_audio_info(video_path))
+
+    # Add additional encoder configuration if provided
+    if camera_encoder is not None:
+        for field_name, field_value in asdict(camera_encoder).items():
+            # vcodec is already populated from the video stream
+            if field_name == "vcodec":
+                continue
+            video_info.setdefault(f"video.{field_name}", field_value)
 
     return video_info
 
